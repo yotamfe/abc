@@ -523,7 +523,7 @@ static inline int Vec_IntSelectSortPrioReverseLit( int * pArray, int nSize, Vec_
   SeeAlso     []
 
 ***********************************************************************/
-int Pdr_ManGeneralize2( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppCubeMin )
+int Pdr_ManGeneralize2( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Vec_Ptr_t * vCubeMins )
 {
 #if 0
     int fUseMinAss = 0;
@@ -678,7 +678,7 @@ int Pdr_ManGeneralize2( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** pp
   SeeAlso     []
 
 ***********************************************************************/
-int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppPred, Pdr_Set_t ** ppCubeMin )
+int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppPred, Vec_Ptr_t * vCubeMins )
 {
     Pdr_Set_t * pCubeMin, * pCubeTmp = NULL, * pPred = NULL, * pCubeCpy = NULL;
     int i, j, Lit, RetValue;
@@ -687,7 +687,6 @@ int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppP
     int added = 0;
     Hash_Int_t * keep = NULL;
     // if there is no induction, return
-    *ppCubeMin = NULL;
     if ( p->pPars->fFlopOrder )
         Vec_IntSelectSortPrioReverseLit( pCube->Lits, pCube->nLits, p->vPrio );
     RetValue = Pdr_ManCheckCube( p, k, pCube, ppPred, p->pPars->nConfLimit, 0, 1 );
@@ -713,12 +712,12 @@ int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppP
         assert( pCubeMin->nLits > 0 );
         if ( pCubeMin->nLits > 1 )
         {
-            RetValue = Pdr_ManGeneralize2( p, k, pCubeMin, ppCubeMin );
+            RetValue = Pdr_ManGeneralize2( p, k, pCubeMin, vCubeMins );
             Pdr_SetDeref( pCubeMin );
-            assert( ppCubeMin != NULL );
-            pCubeMin = *ppCubeMin;
+            pCubeMin = Vec_PtrEntry( vCubeMins, 0 );
+            assert ( pCubeMin != NULL );
         }
-        *ppCubeMin = pCubeMin;
+        Vec_PtrWriteEntry( vCubeMins, 0, pCubeMin );
         if ( p->pPars->fVeryVerbose )
         {
             printf("Cube:\n");
@@ -866,7 +865,7 @@ int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppP
         }
     }
 
-    assert( ppCubeMin != NULL );
+    assert( vCubeMins != NULL );
     if ( p->pPars->fVeryVerbose )
     {
         printf("Cube:\n");
@@ -874,7 +873,8 @@ int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppP
             printf ("%d ", pCubeMin->Lits[i]);
         printf("\n");
     }
-    *ppCubeMin = pCubeMin;
+    Vec_PtrWriteEntry( vCubeMins, 0, pCubeMin );
+//  TODO (YF): Vec_PtrSetEntry( vCubeMins, 1, Pdr_SetDup( pCubeMin ) ); // for testing multiple clauses
     p->tGeneral += Abc_Clock() - clk;
     if ( keep ) Hash_IntFree( keep );
     return 1;
@@ -894,8 +894,9 @@ int Pdr_ManGeneralize( Pdr_Man_t * p, int k, Pdr_Set_t * pCube, Pdr_Set_t ** ppP
 int Pdr_ManBlockCube( Pdr_Man_t * p, Pdr_Set_t * pCube )
 {
     Pdr_Obl_t * pThis;
-    Pdr_Set_t * pPred, * pCubeMin;
-    int i, k, RetValue, Prio = ABC_INFINITY, Counter = 0;
+    Pdr_Set_t * pPred, * pLemma;
+    Vec_Ptr_t * vCubeMins;
+    int i, k, mostSuccessfulK, s, RetValue, Prio = ABC_INFINITY, Counter = 0;
     int kMax = Vec_PtrSize(p->vSolvers)-1;
     abctime clk;
     p->nBlocks++;
@@ -945,56 +946,63 @@ int Pdr_ManBlockCube( Pdr_Man_t * p, Pdr_Set_t * pCube )
         }
 
         // check if the cube holds with relative induction
-        pCubeMin = NULL;
-        RetValue = Pdr_ManGeneralize( p, pThis->iFrame-1, pThis->pState, &pPred, &pCubeMin );
+        vCubeMins = Vec_PtrStart( 1 );
+        RetValue = Pdr_ManGeneralize( p, pThis->iFrame-1, pThis->pState, &pPred, vCubeMins );
         if ( RetValue == -1 ) // resource limit is reached
         {
+            Vec_PtrFree( vCubeMins );
             Pdr_OblDeref( pThis );
             return -1;
         }
         if ( RetValue ) // cube is blocked inductively in this frame
         {
-            assert( pCubeMin != NULL );
-            // k is the last frame where pCubeMin holds
-            k = pThis->iFrame;
-            // check other frames
-            assert( pPred == NULL );
-            for ( k = pThis->iFrame; k < kMax; k++ )
+            mostSuccessfulK = 0;
+            Vec_PtrForEachEntry( Pdr_Set_t *, vCubeMins, pLemma, s)
             {
-                RetValue = Pdr_ManCheckCube( p, k, pCubeMin, NULL, 0, 0, 1 );
-                if ( RetValue == -1 )
-                {
-                    Pdr_OblDeref( pThis );
-                    return -1;
+                assert(pLemma != NULL);
+
+                // k is the last frame where pLemma holds
+                k = pThis->iFrame;
+                // check other frames
+                assert(pPred == NULL);
+                for (k = pThis->iFrame; k < kMax; k++) {
+                    RetValue = Pdr_ManCheckCube(p, k, pLemma, NULL, 0, 0, 1);
+                    if (RetValue == -1) {
+                        Vec_PtrFree( vCubeMins );
+                        Pdr_OblDeref(pThis);
+                        return -1;
+                    }
+                    if (!RetValue)
+                        break;
                 }
-                if ( !RetValue )
-                    break;
+                // add new clause
+                if (p->pPars->fVeryVerbose) {
+                    Abc_Print(1, "Adding cube ");
+                    Pdr_SetPrint(stdout, pLemma, Aig_ManRegNum(p->pAig), NULL);
+                    Abc_Print(1, " to frame %d.\n", k);
+                }
+                // set priority flops
+                for (i = 0; i < pLemma->nLits; i++) {
+                    assert(pLemma->Lits[i] >= 0);
+                    assert((pLemma->Lits[i] / 2) < Aig_ManRegNum(p->pAig));
+                    if ((Vec_IntEntry(p->vPrio, pLemma->Lits[i] / 2) >> p->nPrioShift) == 0)
+                        p->nAbsFlops++;
+                    Vec_IntAddToEntry(p->vPrio, pLemma->Lits[i] / 2, 1 << p->nPrioShift);
+                }
+                Vec_VecPush(p->vClauses, k, pLemma);   // consume ref
+                p->nCubes++;
+                // add clause
+                for (i = 1; i <= k; i++)
+                    Pdr_ManSolverAddClause(p, i, pLemma);
+
+                if (k > mostSuccessfulK) {
+                    mostSuccessfulK = k;
+                }
             }
-            // add new clause
-            if ( p->pPars->fVeryVerbose )
-            {
-                Abc_Print( 1, "Adding cube " );
-                Pdr_SetPrint( stdout, pCubeMin, Aig_ManRegNum(p->pAig), NULL );
-                Abc_Print( 1, " to frame %d.\n", k );
-            }
-            // set priority flops
-            for ( i = 0; i < pCubeMin->nLits; i++ )
-            {
-                assert( pCubeMin->Lits[i] >= 0 );
-                assert( (pCubeMin->Lits[i] / 2) < Aig_ManRegNum(p->pAig) );
-                if ( (Vec_IntEntry(p->vPrio, pCubeMin->Lits[i] / 2) >> p->nPrioShift) == 0 )
-                    p->nAbsFlops++;
-                Vec_IntAddToEntry( p->vPrio, pCubeMin->Lits[i] / 2, 1 << p->nPrioShift );
-            }
-            Vec_VecPush( p->vClauses, k, pCubeMin );   // consume ref
-            p->nCubes++;
-            // add clause
-            for ( i = 1; i <= k; i++ )
-                Pdr_ManSolverAddClause( p, i, pCubeMin );
             // schedule proof obligation
-            if ( (k < kMax || p->pPars->fReuseProofOblig) && !p->pPars->fShortest )
+            if ( (mostSuccessfulK < kMax || p->pPars->fReuseProofOblig) && !p->pPars->fShortest )
             {
-                pThis->iFrame = k+1;
+                pThis->iFrame = mostSuccessfulK+1;
                 pThis->prio   = Prio--;
                 Pdr_QueuePush( p, pThis );
             }
@@ -1005,13 +1013,15 @@ int Pdr_ManBlockCube( Pdr_Man_t * p, Pdr_Set_t * pCube )
         }
         else
         {
-            assert( pCubeMin == NULL );
+            assert( Vec_PtrEntry( vCubeMins, 0 ) == NULL && Vec_PtrSize(vCubeMins) == 1);
             assert( pPred != NULL );
             pThis->prio = Prio--;
             Pdr_QueuePush( p, pThis );
             pThis = Pdr_OblStart( pThis->iFrame-1, Prio--, pPred, Pdr_OblRef(pThis) );
             Pdr_QueuePush( p, pThis );
         }
+
+        Vec_PtrFree( vCubeMins );
 
         // check termination
         if ( p->pPars->pFuncStop && p->pPars->pFuncStop(p->pPars->RunId) )
